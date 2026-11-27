@@ -1,666 +1,592 @@
 #!/usr/bin/env python3
-"""Textbook DOCX builder v2.4: Markdown chapters to formatted Word documents with native equation support."""
-import argparse, re, sys, tempfile
+"""Build editable academic DOCX textbooks from Markdown using Pandoc."""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
 from pathlib import Path
+from typing import Iterable
+
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_SECTION
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
-from docx.oxml import OxmlElement, parse_xml
-from docx.oxml.ns import nsdecls, qn
-import xml.sax.saxutils as saxutils
 
-NAVY = RGBColor(27, 54, 93)
-SLATE = RGBColor(44, 82, 130)
-MUTED = RGBColor(74, 85, 104)
+VERSION = "3.0.0"
+NAVY = "1B365D"
+BLUE = "2C5282"
+PALE = "EAF1F8"
+GRAY = "F4F6F8"
 
-GREEK_AND_SYMBOLS = {
-    r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ', r'\epsilon': 'ε',
-    r'\varepsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ', r'\vartheta': 'ϑ',
-    r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ', r'\nu': 'ν',
-    r'\xi': 'ξ', r'\pi': 'π', r'\varpi': 'ϖ', r'\rho': 'ρ', r'\varrho': 'ϱ',
-    r'\sigma': 'σ', r'\varsigma': 'ς', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
-    r'\varphi': 'ϕ', r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
-    r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ', r'\Xi': 'Ξ',
-    r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Upsilon': 'Υ', r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
-    r'\times': '×', r'\cdot': '·', r'\div': '÷', r'\pm': '±', r'\mp': '∓',
-    r'\le': '≤', r'\leq': '≤', r'\ge': '≥', r'\geq': '≥', r'\ne': '≠', r'\neq': '≠',
-    r'\approx': '≈', r'\equiv': '≡', r'\sim': '∼', r'\propto': '∝',
-    r'\infty': '∞', r'\partial': '∂', r'\nabla': '∇',
-    r'\to': '→', r'\rightarrow': '→', r'\leftarrow': '←', r'\Rightarrow': '⇒',
-    r'\Leftarrow': '⇐', r'\Leftrightarrow': '⇔',
-    r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\subseteq': '⊆',
-    r'\cap': '∩', r'\cup': '∪', r'\forall': '∀', r'\exists': '∃',
-    r'\quad': '  ', r'\qquad': '    ', r'\,': ' ', r'\;': ' ', r'\!': '',
+
+def pandoc_path() -> str:
+    exe = shutil.which("pandoc")
+    if exe:
+        return exe
+    try:
+        import pypandoc
+        path = pypandoc.get_pandoc_path()
+        if path and Path(path).is_file():
+            return path
+    except Exception:
+        pass
+    raise RuntimeError("Pandoc not found. Install with `python -m pip install 'pypandoc_binary>=1.13,<2'` or install system Pandoc.")
+
+
+def set_cell_shading(cell, fill: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        tc_pr.append(shd)
+    shd.set(qn("w:fill"), fill)
+    shd.set(qn("w:val"), "clear")
+
+
+def add_cell_borders(cell, color="D7DEE7", size="5") -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = borders.find(qn("w:" + edge))
+        if node is None:
+            node = OxmlElement("w:" + edge)
+            borders.append(node)
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), size)
+        node.set(qn("w:color"), color)
+
+
+def set_repeat_table_header(row) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    tr_pr.append(tbl_header)
+
+
+def set_table_spacing(table, before=100, after=120) -> None:
+    tbl_pr = table._tbl.tblPr
+    layout = tbl_pr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tbl_pr.append(layout)
+    layout.set(qn("w:type"), "autofit")
+    # Word table spacing is represented by cell paragraph spacing; add consistent
+    # after-spacing to paragraphs in the table without inserting duplicate tblW.
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p.paragraph_format.space_before = Pt(0)
+                p.paragraph_format.space_after = Pt(3)
+
+
+def add_page_field(paragraph) -> None:
+    r = paragraph.add_run()
+    begin = OxmlElement("w:fldChar"); begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText"); instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve"); instr.text = " PAGE "
+    separate = OxmlElement("w:fldChar"); separate.set(qn("w:fldCharType"), "separate")
+    text = OxmlElement("w:t"); text.text = "1"
+    end = OxmlElement("w:fldChar"); end.set(qn("w:fldCharType"), "end")
+    for el in (begin, instr, separate, text, end): r._r.append(el)
+
+
+def add_toc_field(paragraph) -> None:
+    r = paragraph.add_run()
+    begin = OxmlElement("w:fldChar"); begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText"); instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve"); instr.text = ' TOC \\o "1-3" \\h \\z \\u '
+    separate = OxmlElement("w:fldChar"); separate.set(qn("w:fldCharType"), "separate")
+    for el in (begin, instr, separate): r._r.append(el)
+    r2 = paragraph.add_run("Contents are listed above; update page numbers in Word (Ctrl+A, F9).")
+    r2.italic = True; r2.font.size = Pt(9); r2.font.color.rgb = RGBColor.from_string("6B7280")
+    end = OxmlElement("w:fldChar"); end.set(qn("w:fldCharType"), "end")
+    r3 = paragraph.add_run(); r3._r.append(end)
+
+
+def add_toc_preview(doc: Document, heading_records: list[tuple[int, str]], page_break=True) -> None:
+    p = doc.add_paragraph("Table of Contents", style="Title")
+    p.paragraph_format.keep_with_next = True
+    p.paragraph_format.outline_level = 9
+    for level, title in heading_records:
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Inches(max(0, level - 1) * 0.22)
+        p.paragraph_format.space_after = Pt(2)
+        r = p.add_run(title)
+        r.font.name = "Calibri"
+        r.font.size = Pt(10 if level == 1 else 9)
+        if level == 1: r.bold = True
+    p = doc.add_paragraph()
+    add_toc_field(p)
+    if page_break:
+        doc.add_page_break()
+
+
+def parse_heading_records(paths: list[Path]) -> list[tuple[int, str]]:
+    records = []
+    for path in paths:
+        md = path.read_text(encoding="utf-8")
+        in_code = False
+        for line in md.splitlines():
+            if line.lstrip().startswith("```") or line.lstrip().startswith("~~~"):
+                in_code = not in_code; continue
+            if in_code: continue
+            m = re.match(r"^\s*(#{1,3})\s+(.+?)\s*#*\s*$", line)
+            if m and not re.match(r"References\s*$", m.group(2), re.I):
+                heading = re.sub(r"\s+#+\s*$", "", m.group(2))
+                # Pandoc interprets inline Markdown in headings; keep the static
+                # TOC preview consistent and free of raw emphasis/code markers.
+                heading = re.sub(r"\*\*(.*?)\*\*", r"\1", heading)
+                heading = re.sub(r"(?<!\*)\*(.*?)\*(?!\*)", r"\1", heading)
+                heading = re.sub(r"`([^`]+)`", r"\1", heading)
+                records.append((len(m.group(1)), heading))
+    return records
+
+
+def find_asset_paths(markdown: str, source_dir: Path) -> list[Path]:
+    found = []
+    for m in re.finditer(r"!\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+['\"][^'\"]*['\"])?\)", markdown):
+        raw = m.group(1) or m.group(2)
+        if re.match(r"^[a-z]+://", raw, re.I):
+            continue
+        path = (source_dir / raw).resolve()
+        if path.exists(): found.append(path)
+    return found
+
+
+def annotate_markdown(markdown: str, source: Path, chapter_index: int, image_counter: list[int]) -> str:
+    """Add stable per-chapter figure captions/alt text; Pandoc parses the Markdown."""
+    out = []
+    for line in markdown.splitlines():
+        m = re.match(r"^(\s*)!\[([^\]]*)\]\((?:<([^>]+)>|([^\s)]+))(?:\s+(['\"])(.*?)\5)?\)\s*$", line)
+        if m:
+            indent, alt, p1, p2, quote, title = m.groups()
+            target = p1 or p2
+            image_counter[0] += 1
+            caption = title or alt or Path(target).stem
+            alt_text = f"Figure {chapter_index}.{image_counter[0]}: {caption}"
+            # Ensure Pandoc gets a title/caption, and keep spaces-containing paths intact.
+            resolved_target = (source.parent / target).resolve()
+            if not resolved_target.is_file():
+                raise FileNotFoundError(f"Image referenced by {source}: {target}")
+            escaped_target = "<" + str(resolved_target).replace("\\", "/") + ">"
+            out.append(f'{indent}![{alt_text}]({escaped_target} "Figure {chapter_index}.{image_counter[0]}: {caption}")')
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def extract_image_alt_texts(paths: list[Path]) -> list[str]:
+    alts = []
+    pattern = re.compile(r"^\s*!\[([^\]]*)\]\((?:<([^>]+)>|([^\s)]+))(?:\s+(['\"])(.*?)\4)?\)\s*$", re.M)
+    for source in paths:
+        for match in pattern.finditer(source.read_text(encoding="utf-8")):
+            alts.append(match.group(1) or match.group(5) or Path(match.group(2) or match.group(3)).stem)
+    return alts
+
+
+def apply_image_alt_texts(doc: Document, alts: list[str]) -> None:
+    nodes = list(doc._element.body.iter())
+    pictures = [node for node in nodes if node.tag.endswith("}docPr")]
+    for node, alt in zip(pictures, alts):
+        node.set("descr", alt)
+
+
+SUPPORTED_TEX_COMMANDS = {
+    "frac", "dfrac", "tfrac", "sqrt", "left", "right", "middle", "text", "mathrm", "mathbf", "mathit", "mathsf", "mathtt", "mathbb", "mathcal", "mathfrak", "operatorname", "overline", "underline", "vec", "hat", "bar", "tilde", "dot", "ddot", "widehat", "widetilde", "overrightarrow", "overleftarrow", "overbrace", "underbrace", "sum", "prod", "int", "iint", "iiint", "oint", "lim", "sin", "cos", "tan", "sec", "csc", "cot", "arcsin", "arccos", "arctan", "log", "ln", "exp", "max", "min", "arg", "sup", "inf", "det", "gcd", "begin", "end", "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix", "cases", "aligned", "align", "split", "smallmatrix", "array", "alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta", "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu", "xi", "pi", "varpi", "rho", "varrho", "sigma", "varsigma", "tau", "upsilon", "phi", "varphi", "chi", "psi", "omega", "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega", "times", "cdot", "div", "pm", "mp", "le", "leq", "ge", "geq", "ne", "neq", "approx", "equiv", "sim", "propto", "infty", "partial", "nabla", "to", "rightarrow", "leftarrow", "Rightarrow", "Leftarrow", "Leftrightarrow", "in", "notin", "subset", "subseteq", "cap", "cup", "forall", "exists", "quad", "qquad", "displaystyle", "limits", "nolimits", ",", ";", "!"
 }
+MATH_TOKEN = re.compile(r"\$\$(.+?)\$\$|(?<!\$)\$(?!\s)(.+?)(?<!\s)\$(?!\d)", re.S)
 
-def escape_xml(s):
-    return saxutils.escape(s)
 
-def parse_bracket_content(s, idx):
-    """Extract content inside balanced { ... } starting at s[idx] == '{'."""
-    assert s[idx] == '{'
-    depth = 0
-    start = idx + 1
-    for i in range(idx, len(s)):
-        if s[i] == '{':
-            depth += 1
-        elif s[i] == '}':
-            depth -= 1
-            if depth == 0:
-                return s[start:i], i + 1
-    return s[start:], len(s)
+def preserve_unsupported_math(markdown: str, source: Path) -> str:
+    """Warn with source/line and visibly preserve unknown TeX commands as styled source."""
+    def replace(match):
+        expr = (match.group(1) or match.group(2) or "").strip()
+        commands = re.findall(r"(?<!\\)\\([A-Za-z]+)", expr)
+        unknown = sorted({name for name in commands if name not in SUPPORTED_TEX_COMMANDS})
+        if not unknown:
+            return match.group(0)
+        line = markdown[:match.start()].count("\n") + 1
+        print(f"warning: {source}:{line}: unsupported math command(s) {', '.join('\\' + x for x in unknown)}; preserved source expression: {expr}", file=sys.stderr)
+        if match.group(1) is not None:
+            return f"\n\n**Unconverted math source:** `{expr}`\n\n"
+        return f"*Unconverted math source: `{expr}`*"
+    return MATH_TOKEN.sub(replace, markdown)
 
-def latex_to_omml(latex_expr):
-    """Convert LaTeX math expression to OMML <m:oMath> XML string."""
-    s = latex_expr.strip()
-    for sym, repl in GREEK_AND_SYMBOLS.items():
-        s = re.sub(re.escape(sym) + r'(?![a-zA-Z])', repl, s)
 
-    def parse_tokens(text):
-        out = []
-        i = 0
-        n = len(text)
-        while i < n:
-            c = text[i]
-            if c.isspace():
-                i += 1
-                continue
-
-            if text[i:].startswith(r'\frac'):
-                i += 5
-                while i < n and text[i].isspace(): i += 1
-                if i < n and text[i] == '{':
-                    num, i = parse_bracket_content(text, i)
-                else:
-                    num = text[i] if i < n else ''
-                    i += 1
-                while i < n and text[i].isspace(): i += 1
-                if i < n and text[i] == '{':
-                    den, i = parse_bracket_content(text, i)
-                else:
-                    den = text[i] if i < n else ''
-                    i += 1
-                num_omml = "".join(parse_tokens(num))
-                den_omml = "".join(parse_tokens(den))
-                out.append(f'<m:f><m:num>{num_omml}</m:num><m:den>{den_omml}</m:den></m:f>')
-                continue
-
-            if text[i:].startswith(r'\sqrt'):
-                i += 5
-                while i < n and text[i].isspace(): i += 1
-                if i < n and text[i] == '{':
-                    arg, i = parse_bracket_content(text, i)
-                else:
-                    arg = text[i] if i < n else ''
-                    i += 1
-                arg_omml = "".join(parse_tokens(arg))
-                out.append(f'<m:rad><m:radPr><m:degHide m:val="1"/></m:radPr><m:deg/><m:e>{arg_omml}</m:e></m:rad>')
-                continue
-
-            if c in ('^', '_'):
-                is_sup = (c == '^')
-                i += 1
-                while i < n and text[i].isspace(): i += 1
-                if i < n and text[i] == '{':
-                    script_content, i = parse_bracket_content(text, i)
-                else:
-                    script_content = text[i] if i < n else ''
-                    i += 1
-                script_omml = "".join(parse_tokens(script_content))
-
-                prev = out.pop() if out else '<m:r><m:t></m:t></m:r>'
-
-                next_is_comp = False
-                comp_content = None
-                j = i
-                while j < n and text[j].isspace(): j += 1
-                if j < n and text[j] in ('^', '_') and text[j] != c:
-                    j += 1
-                    while j < n and text[j].isspace(): j += 1
-                    if j < n and text[j] == '{':
-                        comp_content, j = parse_bracket_content(text, j)
-                    else:
-                        comp_content = text[j] if j < n else ''
-                        j += 1
-                    i = j
-                    next_is_comp = True
-
-                if next_is_comp:
-                    comp_omml = "".join(parse_tokens(comp_content))
-                    sub_omml = comp_omml if is_sup else script_omml
-                    sup_omml = script_omml if is_sup else comp_omml
-                    out.append(f'<m:sSubSup><m:e>{prev}</m:e><m:sub>{sub_omml}</m:sub><m:sup>{sup_omml}</m:sup></m:sSubSup>')
-                elif is_sup:
-                    out.append(f'<m:sSup><m:e>{prev}</m:e><m:sup>{script_omml}</m:sup></m:sSup>')
-                else:
-                    out.append(f'<m:sSub><m:e>{prev}</m:e><m:sub>{script_omml}</m:sub></m:sSub>')
-                continue
-
-            out.append(f'<m:r><m:t>{escape_xml(c)}</m:t></m:r>')
-            i += 1
-
-        return out
-
-    body = "".join(parse_tokens(s))
-    return f'<m:oMath {nsdecls("m")}>{body}</m:oMath>'
-
-def is_complex_math(expr):
-    """Determine if math expression requires structured OMML (fractions, roots, integrals, etc.)."""
-    return any(k in expr for k in [r'\frac', r'\sqrt', r'\int', r'\sum', r'\prod', r'\lim', r'\matrix', r'\begin'])
-
-def render_simple_inline_math(p, expr):
-    """Render simple inline math into paragraph using native Word runs with superscript/subscript."""
-    s = expr.strip()
-    for sym, repl in GREEK_AND_SYMBOLS.items():
-        s = re.sub(re.escape(sym) + r'(?![a-zA-Z])', repl, s)
-
-    tokens = re.split(r'(\^\{[^}]+\}|\^[0-9a-zA-Z]|_{[^}]+}|_[0-9a-zA-Z])', s)
-    for tok in tokens:
-        if not tok:
+def normalize_short_table_separators(markdown: str) -> str:
+    """Pad one/two-dash pipe-table separators to GFM's three-dash minimum."""
+    lines = markdown.splitlines()
+    for idx, line in enumerate(lines):
+        if not line.strip().startswith("|") or idx == 0:
             continue
-        if tok.startswith('^'):
-            val = tok[2:-1] if tok.startswith('^{') else tok[1:]
-            r = p.add_run(val)
-            r.font.superscript = True
-            r.font.name = 'Cambria Math'
-        elif tok.startswith('_'):
-            val = tok[2:-1] if tok.startswith('_{') else tok[1:]
-            r = p.add_run(val)
-            r.font.subscript = True
-            r.font.name = 'Cambria Math'
+        previous = lines[idx - 1].strip()
+        if not previous.startswith("|"):
+            continue
+        cells = line.strip().strip("|").split("|")
+        normalized = []
+        valid = True
+        for cell in cells:
+            token = cell.strip()
+            match = re.fullmatch(r"(:)?(-+)(:)?", token)
+            if not match:
+                valid = False; break
+            normalized.append((":" if match.group(1) else "") + "---" + (":" if match.group(3) else ""))
+        if valid:
+            lines[idx] = "| " + " | ".join(normalized) + " |"
+    return "\n".join(lines)
+
+
+def prepare_markdown(paths: list[Path], work: Path) -> tuple[list[Path], list[tuple[int, str]]]:
+    prepared = []
+    heading_records = []
+    for idx, source in enumerate(paths, 1):
+        data = preserve_unsupported_math(source.read_text(encoding="utf-8"), source)
+        data = normalize_short_table_separators(data)
+        refs = re.search(r"(?im)^#{1,3}\s+References\s*$", data)
+        if refs:
+            front, refbody = data[:refs.start()], data[refs.end():]
+            # Let Pandoc parse APA paragraphs / list refs. Hanging-indent style applied post-conversion.
+            data = front + "\n## References\n" + refbody
+        counter = [0]
+        data = annotate_markdown(data, source, idx, counter)
+        target = work / f"chapter_{idx:02d}.md"
+        target.write_text(data, encoding="utf-8")
+        prepared.append(target)
+        heading_records.extend(parse_heading_records([target]))
+    return prepared, heading_records
+
+
+def extract_refs_blocks(doc: Document) -> None:
+    """Apply hanging indents to paragraphs under References heading."""
+    in_refs = False
+    for p in doc.paragraphs:
+        if p.style.name.startswith("Heading") and p.text.strip().lower() == "references":
+            in_refs = True; continue
+        if in_refs:
+            if p.style.name.startswith("Heading"):
+                break
+            p.paragraph_format.left_indent = Inches(0.28)
+            p.paragraph_format.first_line_indent = Inches(-0.28)
+            p.paragraph_format.space_after = Pt(6)
+
+
+def add_cover_and_chrome(doc: Document, title, subtitle, author, institution, date, header, footer, toc_enabled, heading_records, page_size):
+    # Rebuild document body while retaining section/settings relationships from Pandoc template.
+    body = doc._element.body
+    sect_pr = body.sectPr
+    for child in list(body):
+        if child is not sect_pr: body.remove(child)
+    for section in doc.sections:
+        section.page_width, section.page_height = (Mm(210), Mm(297)) if page_size == "A4" else (Inches(8.5), Inches(11))
+        section.top_margin = section.bottom_margin = Inches(0.8)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(0.85)
+        section.different_first_page_header_footer = True
+        hp = section.header.paragraphs[0]
+        hp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        rr = hp.add_run(header or title); rr.italic = True; rr.font.size = Pt(8); rr.font.color.rgb = RGBColor.from_string("65758B")
+        fp = section.footer.paragraphs[0]
+        fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if footer: fp.add_run(footer + " | ")
+        add_page_field(fp)
+    for _ in range(3): doc.add_paragraph()
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run(title); r.bold = True; r.font.name = "Calibri"; r.font.size = Pt(28); r.font.color.rgb = RGBColor.from_string(NAVY)
+    for val in (subtitle, author, institution, date):
+        if val:
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            rr = p.add_run(val); rr.font.size = Pt(13); rr.font.color.rgb = RGBColor.from_string(BLUE)
+    doc.add_page_break()
+    if toc_enabled:
+        add_toc_preview(doc, heading_records)
+
+
+def insert_ppr_ordered(p_pr, element) -> None:
+    order = {
+        "pStyle": 0, "keepNext": 1, "keepLines": 2, "pageBreakBefore": 3,
+        "framePr": 4, "widowControl": 5, "numPr": 6, "suppressLineNumbers": 7,
+        "pBdr": 8, "shd": 9, "tabs": 10, "spacing": 21, "ind": 22,
+        "jc": 26, "outlineLvl": 30, "rPr": 33,
+    }
+    rank = order.get(element.tag.split("}")[-1], 50)
+    for idx, child in enumerate(p_pr):
+        child_rank = order.get(child.tag.split("}")[-1], 50)
+        if child_rank > rank:
+            p_pr.insert(idx, element)
+            return
+    p_pr.append(element)
+
+
+def add_spacing_after_tables(doc: Document) -> None:
+    """Separate tables/callouts from following content without duplicating table properties."""
+    body = doc._element.body
+    for child in list(body):
+        if child.tag != qn("w:tbl"):
+            continue
+        nxt = child.getnext()
+        if nxt is None or nxt.tag == qn("w:sectPr"):
+            continue
+        if nxt.tag == qn("w:p"):
+            from docx.text.paragraph import Paragraph
+            paragraph = Paragraph(nxt, doc._body)
+            current = paragraph.paragraph_format.space_before
+            current_pt = current.pt if current is not None else 0
+            if current_pt < 5:
+                paragraph.paragraph_format.space_before = Pt(5)
         else:
-            sub_tokens = re.findall(r'[a-zA-Z]+|[0-9]+|[^a-zA-Z0-9\s]+|\s+', tok)
-            for st in sub_tokens:
-                r = p.add_run(st)
-                r.font.name = 'Cambria Math'
-                if re.fullmatch(r'[a-zA-Z]', st):
-                    r.italic = True
+            spacer = OxmlElement("w:p")
+            ppr = OxmlElement("w:pPr")
+            spacing = OxmlElement("w:spacing")
+            spacing.set(qn("w:before"), "80")
+            spacing.set(qn("w:after"), "80")
+            ppr.append(spacing)
+            spacer.append(ppr)
+            child.addnext(spacer)
 
-def render_inline_math(p, expr):
-    """Prioritize native Word equation support: simple expressions use text runs, complex expressions use OMML."""
-    if is_complex_math(expr):
-        try:
-            omml_str = latex_to_omml(expr)
-            omath = parse_xml(omml_str)
-            p._p.append(omath)
-            return
-        except Exception:
-            pass
-    try:
-        render_simple_inline_math(p, expr)
-        return
-    except Exception:
-        pass
-    # PNG fallback if native runs and OMML fail
-    try:
-        import matplotlib.pyplot as plt
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            path = Path(f.name)
-        f.close()
-        try:
-            fig, ax = plt.subplots(figsize=(0.01, 0.01), dpi=240)
-            ax.axis('off')
-            ax.text(0.5, 0.5, f'${expr}$', fontsize=11, ha='center', va='center')
-            fig.savefig(path, transparent=False, facecolor='white', bbox_inches='tight', pad_inches=0.01)
-            plt.close(fig)
-            r = p.add_run()
-            r.add_picture(str(path), height=Pt(11))
-            return
-        finally:
-            path.unlink(missing_ok=True)
-    except Exception:
-        r = p.add_run(expr)
-        r.italic = True
-        r.font.name = 'Cambria Math'
 
-def render_display_math(d, expr):
-    """Render centered display equation using native OMML with centered paragraph alignment."""
-    p = d.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(6)
-    try:
-        omml_body = latex_to_omml(expr)
-        omml_para = f'<m:oMathPara {nsdecls("m")}>{omml_body}</m:oMathPara>'
-        p._p.append(parse_xml(omml_para))
-        return
-    except Exception:
-        pass
-    # PNG fallback for display equation
-    try:
-        import matplotlib.pyplot as plt
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            path = Path(f.name)
-        f.close()
-        try:
-            fig, ax = plt.subplots(figsize=(6, 1.0), dpi=220)
-            ax.axis('off')
-            ax.text(0.5, 0.5, f'${expr}$', fontsize=16, ha='center', va='center')
-            fig.savefig(path, transparent=False, facecolor='white', bbox_inches='tight', pad_inches=0.08)
-            plt.close(fig)
-            pic = p.add_run().add_picture(str(path))
-            if pic.width > Inches(5.5):
-                pic.width = Inches(5.5)
-            return
-        finally:
-            path.unlink(missing_ok=True)
-    except Exception:
-        r = p.add_run(expr)
-        r.italic = True
-        r.font.name = 'Cambria Math'
-        r.font.size = Pt(14)
+def insert_tcpr_ordered(tc_pr, element) -> None:
+    order = {"tcW": 0, "gridSpan": 1, "hMerge": 2, "vMerge": 3, "tcBorders": 4, "shd": 5, "noWrap": 6, "tcMar": 7, "textDirection": 8, "tcFitText": 9, "vAlign": 10, "hideMark": 11, "headers": 12, "cellIns": 13, "cellDel": 14, "cellMerge": 15, "tcPrChange": 16}
+    rank = order.get(element.tag.split("}")[-1], 50)
+    for idx, child in enumerate(tc_pr):
+        if order.get(child.tag.split("}")[-1], 50) > rank:
+            tc_pr.insert(idx, element); return
+    tc_pr.append(element)
 
-def field(p, code, placeholder=None):
-    """Insert Word field code with separate runs and optional placeholder text."""
-    for kind, text in [('begin', None), ('instr', code), ('separate', None)]:
-        r = p.add_run()
-        e = OxmlElement('w:fldChar' if kind != 'instr' else 'w:instrText')
-        if kind == 'instr':
-            e.set(qn('xml:space'), 'preserve')
-            e.text = ' ' + text + ' '
-        else:
-            e.set(qn('w:fldCharType'), kind)
-        r._r.append(e)
-    if placeholder:
-        r_ph = p.add_run(placeholder)
-        r_ph.font.name = 'Calibri'
-        r_ph.font.size = Pt(10)
-        r_ph.font.italic = True
-        r_ph.font.color.rgb = MUTED
-    r_end = p.add_run()
-    e_end = OxmlElement('w:fldChar')
-    e_end.set(qn('w:fldCharType'), 'end')
-    r_end._r.append(e_end)
 
-def add_num_instance(doc, abstract_num_id=7, start=1):
-    """Create a decoupled numbering sequence starting at the given start index."""
-    try:
-        numbering = doc.part.numbering_part.element
-        existing_nums = [
-            int(n.get(qn('w:numId')))
-            for n in numbering.findall(qn('w:num'))
-            if n.get(qn('w:numId')) is not None and n.get(qn('w:numId')).isdigit()
-        ]
-        new_num_id = max(existing_nums, default=0) + 1
-        new_num = parse_xml(f'''
-            <w:num {nsdecls("w")} w:numId="{new_num_id}">
-                <w:abstractNumId w:val="{abstract_num_id}"/>
-                <w:lvlOverride w:ilvl="0">
-                    <w:startOverride w:val="{start}"/>
-                </w:lvlOverride>
-            </w:num>
-        ''')
-        numbering.append(new_num)
-        return new_num_id
-    except Exception:
-        return None
+def set_callout_cell(cell) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right"):
+        node = OxmlElement("w:" + edge)
+        node.set(qn("w:val"), "single"); node.set(qn("w:sz"), "8")
+        node.set(qn("w:color"), "C8D8E8"); borders.append(node)
+    insert_tcpr_ordered(tc_pr, borders)
+    shading = OxmlElement("w:shd"); shading.set(qn("w:val"), "clear"); shading.set(qn("w:fill"), PALE)
+    insert_tcpr_ordered(tc_pr, shading)
+    margins = OxmlElement("w:tcMar")
+    for side, width in (("top", "100"), ("start", "140"), ("bottom", "100"), ("end", "140")):
+        item = OxmlElement("w:" + side); item.set(qn("w:w"), width); item.set(qn("w:type"), "dxa"); margins.append(item)
+    insert_tcpr_ordered(tc_pr, margins)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-def set_list_number(p, num_id):
-    """Assign specific numbering instance to paragraph."""
-    if num_id is not None:
-        pPr = p._p.get_or_add_pPr()
-        numPr = OxmlElement('w:numPr')
-        ilvl = OxmlElement('w:ilvl')
-        ilvl.set(qn('w:val'), '0')
-        num_elem = OxmlElement('w:numId')
-        num_elem.set(qn('w:val'), str(num_id))
-        numPr.append(ilvl)
-        numPr.append(num_elem)
-        pPr.append(numPr)
 
-def make_doc(title, size='A4', header=None, footer=None):
-    d = Document()
-    for s in d.sections:
-        s.page_width, s.page_height = (Mm(210), Mm(297)) if size == 'A4' else (Inches(8.5), Inches(11))
-        s.top_margin = s.bottom_margin = Inches(1)
-        s.left_margin = Inches(1.15)
-        s.right_margin = Inches(1)
-        s.different_first_page_header_footer = True
-        p = s.header.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        r = p.add_run(header or title)
-        r.font.name = 'Calibri'
-        r.font.size = Pt(9)
-        r.font.italic = True
-        r.font.color.rgb = MUTED
-        p = s.footer.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if footer:
-            p.add_run(footer + ' | ')
-        field(p, 'PAGE')
-    st = d.styles['Normal']
-    st.font.name = 'Georgia'
-    st.font.size = Pt(11)
-    st.paragraph_format.line_spacing = 1.15
-    st.paragraph_format.space_after = Pt(6)
-    for n, sz, col in [('Heading 1', 16, NAVY), ('Heading 2', 13, SLATE), ('Heading 3', 11, SLATE)]:
-        st = d.styles[n]
-        st.font.name = 'Calibri'
-        st.font.size = Pt(sz)
-        st.font.bold = True
-        st.font.color.rgb = col
+def convert_blockquotes_to_callout_tables(doc: Document) -> None:
+    """Group consecutive Pandoc Block Text paragraphs into one shaded one-cell callout table."""
+    body = doc._element.body
+    children = list(body)
+    groups = []
+    current = []
+    for child in children:
+        is_block = child.tag == qn("w:p") and child.find(qn("w:pPr")) is not None and child.find(qn("w:pPr")).find(qn("w:pStyle")) is not None and child.find(qn("w:pPr")).find(qn("w:pStyle")).get(qn("w:val")) == "BlockText"
+        if is_block:
+            current.append(child)
+        elif current:
+            groups.append(current); current = []
+    if current: groups.append(current)
+    # Process in reverse document order so saved child indices remain stable.
+    for group in reversed(groups):
+        first_index = body.index(group[0])
+        table = doc.add_table(rows=1, cols=1)
+        tbl = table._tbl
+        tbl.getparent().remove(tbl)
+        body.insert(first_index, tbl)
+        cell = table.cell(0, 0)
+        # Apply borders directly; the minimal Pandoc-generated template does not
+        # necessarily include the built-in Table Grid style.
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        default_p = cell.paragraphs[0]._p
+        cell._tc.remove(default_p)
+        for paragraph in group:
+            body.remove(paragraph)
+            cell._tc.append(paragraph)
+        set_callout_cell(cell)
+        for paragraph in cell.paragraphs:
+            paragraph.paragraph_format.left_indent = Inches(0)
+            paragraph.paragraph_format.right_indent = Inches(0)
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(3)
+        tbl_pr = tbl.tblPr
+        caption = OxmlElement("w:tblCaption"); caption.set(qn("w:val"), "Callout")
+        # tblCaption follows tblLook and is kept after standard table properties.
+        tbl_pr.append(caption)
+
+
+def style_document(doc: Document) -> None:
+    convert_blockquotes_to_callout_tables(doc)
+    styles = doc.styles
+    get_style = lambda name: styles.get_by_id(name.replace(" ", ""), 1)
+    normal = get_style("Normal")
+    normal.font.name = "Georgia"; normal.font.size = Pt(10.5)
+    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.12
+    for name, size in (("Heading 1", 16), ("Heading 2", 13), ("Heading 3", 11)):
+        st = get_style(name); st.font.name = "Calibri"; st.font.size = Pt(size)
+        st.font.bold = True; st.font.color.rgb = RGBColor.from_string(NAVY if name == "Heading 1" else BLUE)
         st.paragraph_format.keep_with_next = True
-    return d
+    # Pandoc blockquotes become Block Text paragraphs; style them as restrained callouts.
+    if any(s.style_id == "BlockText" for s in styles):
+        st = get_style("Block Text")
+        st.font.name = "Georgia"; st.font.size = Pt(10.5); st.font.bold = False
+        st.paragraph_format.left_indent = Inches(0.18)
+        st.paragraph_format.right_indent = Inches(0.12)
+        st.paragraph_format.space_before = Pt(5); st.paragraph_format.space_after = Pt(8)
+    if any(s.style_id == "SourceCode" for s in styles):
+        st = get_style("Source Code")
+        st.font.name = "Consolas"; st.font.size = Pt(9)
+        st.paragraph_format.left_indent = Inches(0.12)
+        st.paragraph_format.space_before = Pt(4); st.paragraph_format.space_after = Pt(8)
+        st.paragraph_format.keep_together = True
+    # Native table header repeat and consistent alignment.
+    for table in doc.tables:
+        caption = table._tbl.tblPr.find(qn("w:tblCaption"))
+        if table.rows and (caption is None or caption.get(qn("w:val")) != "Callout"):
+            set_repeat_table_header(table.rows[0])
+        set_table_spacing(table)
+        for row in table.rows:
+            for cell in row.cells:
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    # Source-code paragraphs receive explicit shading and padding.
+    for p in doc.paragraphs:
+        if p.style.name == "Source Code":
+            p_pr = p._p.get_or_add_pPr()
+            shd = OxmlElement("w:shd"); shd.set(qn("w:fill"), GRAY); shd.set(qn("w:val"), "clear"); insert_ppr_ordered(p_pr, shd)
 
-def cover(d, title, author, institution, subtitle, date):
-    for _ in range(3):
-        d.add_paragraph()
-    p = d.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(title)
-    r.bold = True
-    r.font.name = 'Calibri'
-    r.font.size = Pt(30)
-    r.font.color.rgb = NAVY
-    for value in (subtitle, author, institution, date):
-        if value:
-            p = d.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run(value)
-            r.font.size = Pt(13)
-            r.font.color.rgb = SLATE
-    d.add_page_break()
+    for p in doc.paragraphs:
+        if p.style.name.lower().startswith("source code"):
+            p.paragraph_format.space_before = Pt(5); p.paragraph_format.space_after = Pt(8)
+    extract_refs_blocks(doc)
+    add_spacing_after_tables(doc)
 
-def inline(p, text):
-    """Format inline markdown: bold, italic, inline code, and inline math."""
-    tick = chr(96)
-    rx = re.compile(
-        r'(\*\*.+?\*\*|(?<!\*)\*[^*]+\*|' + re.escape(tick) + r'[^' + re.escape(tick) + r']+' + re.escape(tick) + r'|\$[^$]+\$)'
-    )
-    pos = 0
-    for m in rx.finditer(text):
-        p.add_run(text[pos:m.start()])
-        x = m.group()
-        if x.startswith('**'):
-            p.add_run(x[2:-2]).bold = True
-        elif x.startswith(tick):
-            r = p.add_run(x[1:-1])
-            r.font.name = 'Consolas'
-        elif x.startswith('$') and x.endswith('$') and len(x) > 2:
-            render_inline_math(p, x[1:-1])
-        else:
-            p.add_run(x[1:-1]).italic = True
-        pos = m.end()
-    p.add_run(text[pos:])
 
-def callout(d, title, body):
-    t = d.add_table(rows=1, cols=1)
-    t.style = 'Light Shading Accent 1'
-    c = t.cell(0, 0)
-    p = c.paragraphs[0]
-    r = p.add_run(title)
-    r.bold = True
-    r.font.color.rgb = NAVY
-    inline(c.add_paragraph(), body)
+def set_metadata(doc: Document, title: str, author: str | None) -> None:
+    props = doc.core_properties
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None, microsecond=0)
+    props.title = title
+    props.author = author or ""
+    props.subject = ""
+    props.comments = ""
+    props.keywords = ""
+    props.category = ""
+    props.created = now
+    props.modified = now
+    props.last_modified_by = author or ""
 
-def _set_cell_shading(cell, color_hex):
-    """Apply background shading to a table cell via OpenXML."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shading = OxmlElement('w:shd')
-    shading.set(qn('w:fill'), color_hex)
-    shading.set(qn('w:val'), 'clear')
-    shading.set(qn('w:color'), 'auto')
-    tcPr.append(shading)
 
-def _set_cell_borders(cell, color_hex='D0D0D0', size='4'):
-    """Apply subtle borders to all four sides of a table cell."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    borders = OxmlElement('w:tcBorders')
-    for edge in ('top', 'left', 'bottom', 'right'):
-        el = OxmlElement(f'w:{edge}')
-        el.set(qn('w:val'), 'single')
-        el.set(qn('w:sz'), size)
-        el.set(qn('w:space'), '0')
-        el.set(qn('w:color'), color_hex)
-        borders.append(el)
-    tcPr.append(borders)
-
-def add_code_block(d, block):
-    """Render code block in a shaded, bordered single-cell table with monospaced font.
-
-    Short blocks (≤25 lines) keep lines together to prevent page splitting.
-    Long blocks split cleanly across pages.
-    """
-    # Use a single-cell table for reliable background + border in all renderers
-    tbl = d.add_table(rows=1, cols=1)
-    tbl.style = 'Normal Table'
-    # Remove any auto-width stretching issues
-    tbl.autofit = True
-    cell = tbl.cell(0, 0)
-
-    # Apply light grey background and subtle border
-    _set_cell_shading(cell, 'F5F5F5')
-    _set_cell_borders(cell, 'D0D0D0', '4')
-
-    # Set cell margins for consistent indentation / padding
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    mar = OxmlElement('w:tcMar')
-    for side, val in [('top', '60'), ('left', '120'), ('bottom', '60'), ('right', '120')]:
-        el = OxmlElement(f'w:{side}')
-        el.set(qn('w:w'), val)
-        el.set(qn('w:type'), 'dxa')
-        mar.append(el)
-    tcPr.append(mar)
-
-    # Clear the default empty paragraph and write code
-    p = cell.paragraphs[0]
-    p.paragraph_format.line_spacing = 1.0
-    p.paragraph_format.space_before = Pt(2)
-    p.paragraph_format.space_after = Pt(2)
-    if len(block) <= 25:
-        p.paragraph_format.keep_together = True
+def fix_settings_order(doc: Document) -> None:
+    settings = doc.settings.element
+    existing = settings.find(qn("w:updateFields"))
+    if existing is not None: settings.remove(existing)
+    update = OxmlElement("w:updateFields"); update.set(qn("w:val"), "true")
+    # CT_Settings schema puts updateFields before compatibility/document protection tail nodes.
+    insert_before = ("w:hdrShapeDefaults", "w:footnotePr", "w:endnotePr", "w:compat", "w:docVars", "w:rsids", "m:mathPr", "w:attachedSchema", "w:themeFontLang", "w:clrSchemeMapping", "w:doNotIncludeSubdocsInStats", "w:doNotAutoCompressPictures", "w:forceUpgrade", "w: Captions")
+    qnames = [qn(x) for x in insert_before if " " not in x]
+    for child in list(settings):
+        if child.tag in qnames:
+            settings.insert(settings.index(child), update); break
     else:
-        p.paragraph_format.keep_together = False
-    r = p.add_run('\n'.join(block))
-    r.font.name = 'Consolas'
-    r.font.size = Pt(9)
-    r.font.color.rgb = RGBColor(0x2D, 0x2D, 0x2D)
+        settings.append(update)
 
-    # Add spacing around the table
-    tbl_elem = tbl._tbl
-    tblPr = tbl_elem.find(qn('w:tblPr'))
-    if tblPr is None:
-        tblPr = OxmlElement('w:tblPr')
-        tbl_elem.insert(0, tblPr)
-    # Set table width to 100%
-    tblW = OxmlElement('w:tblW')
-    tblW.set(qn('w:w'), '5000')
-    tblW.set(qn('w:type'), 'pct')
-    tblPr.append(tblW)
 
-    return tbl
+def postprocess(path: Path, title: str, author: str | None, subtitle: str | None, institution: str | None, date: str | None, header: str | None, footer: str | None, toc: bool, heading_records, page_size: str, image_alts: list[str]) -> None:
+    doc = Document(path)
+    # Save converted body, then inject front matter before the existing body contents.
+    body = doc._element.body
+    sect_pr = body.sectPr
+    content = [el for el in list(body) if el is not sect_pr]
+    for el in content: body.remove(el)
+    # front matter is inserted using python-docx; existing content nodes are then appended back.
+    add_cover_and_chrome(doc, title, subtitle, author, institution, date, header, footer, toc, heading_records, page_size)
+    for el in content: body.insert(body.index(sect_pr) if sect_pr is not None else len(body), el)
+    # Replace Pandoc marker paragraph with an actual page break between chapters.
+    for p in list(doc.paragraphs):
+        if p.text.strip() == "CHAPTERBREAKTOKEN":
+            p.clear()
+            p.add_run().add_break(WD_BREAK.PAGE)
+    apply_image_alt_texts(doc, image_alts)
+    style_document(doc)
+    set_metadata(doc, title, author)
+    fix_settings_order(doc)
+    doc.save(path)
 
-def render(d, text, base, chapter, figs, refs):
-    lines = text.splitlines()
-    i = 0
-    code = False
-    block = []
-    current_num_id = None
 
-    while i < len(lines):
-        s = lines[i].strip()
-        if s.startswith(chr(96) * 3):
-            current_num_id = None
-            if code:
-                add_code_block(d, block)
-                block = []
-                code = False
-            else:
-                code = True
-            i += 1
-            continue
-        if code:
-            block.append(lines[i])
-            i += 1
-            continue
-        if not s:
-            current_num_id = None
-            i += 1
-            continue
-        if re.match(r'^#{1,2}\s+References$', s, re.I):
-            current_num_id = None
-            refs.extend(re.findall(r'^\s*(?:[-*+] |\d+[.)] )(.+)$', '\n'.join(lines[i + 1:]), re.M))
-            break
-        if s == '$$':
-            current_num_id = None
-            eq = []
-            i += 1
-            while i < len(lines) and lines[i].strip() != '$$':
-                eq.append(lines[i].strip())
-                i += 1
-            if i < len(lines):
-                i += 1
-            render_display_math(d, ' '.join(eq))
-            continue
-        if s.startswith('$$') and s.endswith('$$') and len(s) > 4:
-            current_num_id = None
-            render_display_math(d, s[2:-2])
-            i += 1
-            continue
-        h = re.match(r'^(#{1,6})\s+(.+)', s)
-        if h:
-            current_num_id = None
-            count = len(h.group(1))
-            level = min(count, 3)
-            p = d.add_paragraph(h.group(2), style='Heading ' + str(level))
-            if count == 1 and len(d.paragraphs) > 1:
-                p.paragraph_format.page_break_before = True
-            i += 1
-            continue
-        im = re.fullmatch(r'!\[([^]]*)\]\(([^)]+)\)', s)
-        if im:
-            current_num_id = None
-            figs[0] += 1
-            cap, src = im.groups()
-            path = Path(src)
-            if not path.is_absolute():
-                path = base / path
-            if not path.is_file():
-                raise FileNotFoundError('Missing figure: ' + str(path))
-            p = d.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.keep_with_next = True
-            p.add_run().add_picture(str(path), width=Inches(5))
-            p = d.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run(f'Figure {chapter}.{figs[0]}: ')
-            r.bold = True
-            p.add_run(cap)
-            i += 1
-            continue
-        if s.startswith('>'):
-            current_num_id = None
-            q = s[1:].strip()
-            m = re.match(r'\*\*(.+?)\*\*:?\s*(.*)', q)
-            callout(d, m.group(1), m.group(2) or m.group(1)) if m else callout(d, 'Note', q)
-            i += 1
-            continue
-        if s.startswith('|') and i + 1 < len(lines) and re.match(r'^\s*\|?\s*:?-{3,}', lines[i + 1]):
-            current_num_id = None
-            rows = [s, lines[i + 1].strip()]
-            i += 2
-            while i < len(lines) and '|' in lines[i]:
-                rows.append(lines[i].strip())
-                i += 1
-            rows = [[x.strip() for x in row.strip('|').split('|')] for row in rows if not re.match(r'^\s*\|?\s*:?-{3,}', row)]
-            if rows:
-                t = d.add_table(rows=1, cols=max(map(len, rows)))
-                t.style = 'Light Shading Accent 1'
-                for ri, row in enumerate(rows):
-                    cells = t.rows[0].cells if ri == 0 else t.add_row().cells
-                    for ci, x in enumerate(row):
-                        cells[ci].text = ''
-                        inline(cells[ci].paragraphs[0], x)
-                        if ri == 0:
-                            for r in cells[ci].paragraphs[0].runs:
-                                r.bold = True
-            continue
-        m = re.match(r'^[-*+]\s+(.+)', s)
-        if m:
-            current_num_id = None
-            inline(d.add_paragraph(style='List Bullet'), m.group(1))
-            i += 1
-            continue
-        m = re.match(r'^\d+[.)]\s+(.+)', s)
-        if m:
-            if current_num_id is None:
-                current_num_id = add_num_instance(d, abstract_num_id=7, start=1)
-            p = d.add_paragraph(style='List Number')
-            set_list_number(p, current_num_id)
-            inline(p, m.group(1))
-            i += 1
-            continue
-        current_num_id = None
-        p = d.add_paragraph()
-        inline(p, s)
-        i += 1
-    if block:
-        add_code_block(d, block)
+def validate_docx(path: Path) -> None:
+    doc = Document(path)
+    if not doc.paragraphs and not doc.tables:
+        raise RuntimeError("Generated DOCX has no body content")
+    with zipfile.ZipFile(path) as zf:
+        bad = zf.testzip()
+        if bad: raise RuntimeError(f"DOCX ZIP integrity error: {bad}")
+        xml = zf.read("word/document.xml").decode("utf-8", "replace")
+        for forbidden in ("<w:tblW",):
+            # Multiple table widths per tblPr are a known validity defect; check each table.
+            pass
+        for match in re.finditer(r"<w:tblPr(?:\s[^>]*)?>(.*?)</w:tblPr>", xml, re.S):
+            if match.group(1).count("<w:tblW") > 1:
+                raise RuntimeError("Duplicate w:tblW in table properties")
+        if "<w:updateFields" not in zf.read("word/settings.xml").decode("utf-8", "replace"):
+            raise RuntimeError("Missing updateFields setting")
 
-def build(inputs, out, title=None, author=None, institution=None, subtitle=None, date=None, size='A4', header=None, footer=None, toc=True, overwrite=False):
-    files = [Path(x).expanduser().resolve() for x in inputs]
-    out = Path(out).expanduser().resolve()
-    if not files or any(not f.is_file() or f.suffix.lower() != '.md' for f in files):
-        raise ValueError('Provide existing Markdown (.md) chapter files.')
+
+def build(inputs, output, title=None, subtitle=None, author=None, institution=None, date=None, page_size="A4", header_text=None, footer_text=None, toc=True, overwrite=False):
+    paths = [Path(x).expanduser().resolve() for x in inputs]
+    out = Path(output).expanduser().resolve()
+    if not paths or any(not p.is_file() or p.suffix.lower() != ".md" for p in paths):
+        raise ValueError("Provide one or more existing Markdown (.md) chapter files")
     if out.exists() and not overwrite:
-        raise FileExistsError(str(out) + ' exists; pass --overwrite to replace.')
-    title = title or files[0].stem.replace('_', ' ').title()
-    d = make_doc(title, size, header, footer)
-    d.core_properties.title = title
-    if author:
-        d.core_properties.author = author
-    cover(d, title, author, institution, subtitle, date)
-    if toc:
-        d.add_paragraph('Table of Contents', style='Heading 1')
-        p = d.add_paragraph()
-        field(p, 'TOC \\o "1-3" \\h \\z \\u', placeholder='Table of Contents (Right-click and select "Update Field" in Word to populate)')
-        d.add_page_break()
-    refs = []
-    figs = [0]
-    for n, f in enumerate(files, 1):
-        if n > 1:
-            d.add_page_break()
-        render(d, f.read_text(encoding='utf-8'), f.parent, n, figs, refs)
-    if refs:
-        d.add_paragraph('References', style='Heading 1')
-        ref_num_id = add_num_instance(d, abstract_num_id=7, start=1)
-        for ref in refs:
-            p = d.add_paragraph(style='List Number')
-            set_list_number(p, ref_num_id)
-            inline(p, ref)
-    upd = OxmlElement('w:updateFields')
-    upd.set(qn('w:val'), 'true')
-    d.settings.element.append(upd)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    d.save(str(out))
-    if not out.is_file() or out.stat().st_size == 0:
-        raise RuntimeError('DOCX output missing or empty.')
-    Document(str(out))
+        raise FileExistsError(f"{out} already exists; pass --overwrite to replace")
+    pandoc = pandoc_path()
+    title = title or paths[0].stem.replace("_", " ").title()
+    image_alts = extract_image_alt_texts(paths)
+    with tempfile.TemporaryDirectory(prefix="textbook_docx_") as tmp:
+        work = Path(tmp)
+        prepared, headings = prepare_markdown(paths, work)
+        combined = work / "combined.md"
+        combined.write_text("\n\nCHAPTERBREAKTOKEN\n\n".join(p.read_text(encoding="utf-8") for p in prepared), encoding="utf-8")
+        reference = work / "reference.docx"
+        template = subprocess.run([pandoc, "--print-default-data-file=reference.docx"], check=True, capture_output=True)
+        reference.write_bytes(template.stdout)
+        args = [pandoc, str(combined), "--from=markdown+tex_math_dollars+pipe_tables+fenced_code_blocks+implicit_figures+link_attributes+autolink_bare_uris", "--to=docx", "--reference-doc", str(reference), "--standalone", "--output", str(out)]
+        result = subprocess.run(args, capture_output=True, text=True)
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
+        if result.returncode:
+            raise RuntimeError("Pandoc failed: " + (result.stderr.strip() or result.stdout.strip()))
+    postprocess(out, title, author, subtitle, institution, date, header_text, footer_text, toc, headings, page_size, image_alts)
+    validate_docx(out)
     return out
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description='Build a textbook DOCX from one or more Markdown chapters.')
-    p.add_argument('inputs', nargs='+', type=Path)
-    p.add_argument('-o', '--output', required=True, type=Path)
-    for flag in ('title', 'subtitle', 'author', 'institution', 'date', 'header-text', 'footer-text'):
-        p.add_argument('--' + flag)
-    p.add_argument('--page-size', choices=('A4', 'LETTER'), default='A4')
-    p.add_argument('--no-toc', action='store_true')
-    p.add_argument('--overwrite', action='store_true')
-    p.add_argument('--version', action='version', version='textbook-docx 2.4.0')
-    a = p.parse_args(argv)
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Build editable Word textbooks from Markdown chapters using Pandoc.")
+    parser.add_argument("inputs", nargs="+", type=Path)
+    parser.add_argument("-o", "--output", required=True, type=Path)
+    for flag in ("title", "subtitle", "author", "institution", "date", "header-text", "footer-text"):
+        parser.add_argument("--" + flag)
+    parser.add_argument("--page-size", choices=("A4", "LETTER"), default="A4")
+    parser.add_argument("--no-toc", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--version", action="version", version=f"textbook-docx {VERSION}")
+    a = parser.parse_args(argv)
     try:
-        result = build(a.inputs, a.output, a.title, a.author, a.institution, a.subtitle, a.date, a.page_size, a.header_text, a.footer_text, not a.no_toc, a.overwrite)
-    except (OSError, ValueError, RuntimeError) as e:
-        print('error:', e, file=sys.stderr)
+        path = build(a.inputs, a.output, a.title, a.subtitle, a.author, a.institution, a.date, a.page_size, a.header_text, a.footer_text, not a.no_toc, a.overwrite)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    print('Created and validated:', result)
-    if not a.no_toc:
-        print('If needed, update the TOC field in Word (right-click > Update Field).')
+    print(f"Created and validated: {path}")
+    if not a.no_toc: print("TOC preview is populated; update fields in Word with Ctrl+A, F9 to refresh page numbers.")
     return 0
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())
