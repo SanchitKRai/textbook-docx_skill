@@ -218,7 +218,8 @@ def preserve_unsupported_math(markdown: str, source: Path) -> str:
         if not unknown:
             return match.group(0)
         line = markdown[:match.start()].count("\n") + 1
-        print(f"warning: {source}:{line}: unsupported math command(s) {', '.join('\\' + x for x in unknown)}; preserved source expression: {expr}", file=sys.stderr)
+        unknown_commands = ", ".join("\\" + name for name in unknown)
+        print(f"warning: {source}:{line}: unsupported math command(s) {unknown_commands}; preserved source expression: {expr}", file=sys.stderr)
         if match.group(1) is not None:
             return f"\n\n**Unconverted math source:** `{expr}`\n\n"
         return f"*Unconverted math source: `{expr}`*"
