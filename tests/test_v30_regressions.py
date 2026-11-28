@@ -135,11 +135,13 @@ def test_08_inline_links_math_inside_bold_headings_and_horizontal_rule(tmp_path)
     pdf, text = render(docx, tmp_path / "inline")
     assert "OpenStax Biology" in text
     assert "https://www.ncbi.nlm.nih.gov/books/" in text
-    assert "the energy relation is" in text and "E=m" in text
+    assert "the energy relation is" in text
     assert "CHAPTERBREAKTOKEN" not in text
     with zipfile.ZipFile(docx) as zf:
         rels = zf.read("word/_rels/document.xml.rels").decode("utf-8")
         document_xml = zf.read("word/document.xml").decode("utf-8")
+    math_xml = re.findall(r"<m:oMath>(.*?)</m:oMath>", document_xml, re.S)
+    assert math_xml and "".join(re.findall(r"<m:t>(.*?)</m:t>", math_xml[0])) == "E=mc2"
     assert "https://openstax.org/details/books/biology-2e" in rels
     assert "https://www.ncbi.nlm.nih.gov/books/" in rels
     assert "<w:pict>" in document_xml and "o:hr=\"t\"" in document_xml, "Markdown --- must become a Word horizontal-rule drawing"
