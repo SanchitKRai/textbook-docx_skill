@@ -1,20 +1,67 @@
-name: Test textbook-docx CLI
+name: textbook-docx v3.0 validation
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  test:
+  regression-and-render:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt pytest
-      - name: Run CLI tests
-        run: pytest -q
+      - name: Install LibreOffice Writer/Math and PDF utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-writer libreoffice-math poppler-utils
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Run complete regression suite (no skips permitted)
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -ra
+      - name: Generate sample output
+        run: |
+          . .venv/bin/activate
+          python scripts/build_textbook.py examples/01_cell_structure.md examples/02_cell_division.md \
+            --output examples/sample_output.docx --title "Cell Biology: A Sample Textbook" \
+            --subtitle "BSc Life Sciences" --author "CI Sample" --institution "University of Delhi" \
+            --date "2026" --overwrite
+      - name: Render sample and verify PDF text/page count
+        run: |
+          mkdir -p build/sample
+          soffice --headless --convert-to pdf --outdir build/sample examples/sample_output.docx
+          pdfinfo build/sample/sample_output.pdf | tee build/sample/pdfinfo.txt
+          pdftotext -layout build/sample/sample_output.pdf build/sample/sample_output.txt
+          python scripts/check_rendered_text.py build/sample/sample_output.pdf build/sample/sample_output.txt
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Validate ISO/IEC 29500 OOXML with Open XML SDK
+        run: |
+          dotnet build tools/OoxmlValidator/OoxmlValidator.csproj --configuration Release
+          dotnet run --project tools/OoxmlValidator/OoxmlValidator.csproj --configuration Release --no-build -- examples/sample_output.docx
+      - name: Fresh-venv install smoke test
+        run: |
+          python -m venv /tmp/textbook-fresh
+          /tmp/textbook-fresh/bin/python -m pip install -r requirements.txt
+          /tmp/textbook-fresh/bin/python scripts/build_textbook.py examples/01_cell_structure.md examples/02_cell_division.md \
+            --output cell-biology.docx --title "Cell Biology" --subtitle "BSc Life Sciences" \
+            --author "Author Name" --institution "University of Delhi" --date "2026"
+      - name: Upload generated verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: textbook-docx-v3-validation
+          path: |
+            examples/sample_output.docx
+            build/sample/sample_output.pdf
+            build/sample/sample_output.txt
