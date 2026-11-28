@@ -72,9 +72,11 @@ def add_cell_borders(cell, color="D7DEE7", size="5") -> None:
 
 def set_repeat_table_header(row) -> None:
     tr_pr = row._tr.get_or_add_trPr()
-    tbl_header = OxmlElement("w:tblHeader")
-    tbl_header.set(qn("w:val"), "true")
-    tr_pr.append(tbl_header)
+    tbl_header = tr_pr.find(qn("w:tblHeader"))
+    if tbl_header is None:
+        tbl_header = OxmlElement("w:tblHeader")
+        tr_pr.append(tbl_header)
+    tbl_header.set(qn("w:val"), "on")
 
 
 def set_table_spacing(table, before=100, after=120) -> None:
@@ -82,7 +84,14 @@ def set_table_spacing(table, before=100, after=120) -> None:
     layout = tbl_pr.find(qn("w:tblLayout"))
     if layout is None:
         layout = OxmlElement("w:tblLayout")
-        tbl_pr.append(layout)
+        following = next((child for child in tbl_pr if child.tag in {
+            qn("w:tblCellMar"), qn("w:tblLook"), qn("w:tblCaption"),
+            qn("w:tblDescription"), qn("w:tblPrChange"),
+        }), None)
+        if following is None:
+            tbl_pr.append(layout)
+        else:
+            tbl_pr.insert(tbl_pr.index(following), layout)
     layout.set(qn("w:type"), "autofit")
     # Word table spacing is represented by cell paragraph spacing; add consistent
     # after-spacing to paragraphs in the table without inserting duplicate tblW.
@@ -500,6 +509,21 @@ def fix_settings_order(doc: Document) -> None:
         settings.append(update)
 
 
+def normalize_math_markup(doc: Document) -> None:
+    for count in doc._element.iter(qn("m:count")):
+        parent = count.getparent()
+        if parent.tag == qn("m:mcPr"):
+            mc_jc = parent.find(qn("m:mcJc"))
+            if mc_jc is not None and parent.index(count) > parent.index(mc_jc):
+                parent.remove(count)
+                parent.insert(parent.index(mc_jc), count)
+    for run_properties in doc._element.iter(qn("m:rPr")):
+        if run_properties.find(qn("m:nor")) is not None:
+            style = run_properties.find(qn("m:sty"))
+            if style is not None:
+                run_properties.remove(style)
+
+
 def postprocess(path: Path, title: str, author: str | None, subtitle: str | None, institution: str | None, date: str | None, header: str | None, footer: str | None, toc: bool, heading_records, page_size: str, image_alts: list[str]) -> None:
     doc = Document(path)
     # Save converted body, then inject front matter before the existing body contents.
@@ -519,6 +543,7 @@ def postprocess(path: Path, title: str, author: str | None, subtitle: str | None
     style_document(doc)
     set_metadata(doc, title, author)
     fix_settings_order(doc)
+    normalize_math_markup(doc)
     doc.save(path)
 
 

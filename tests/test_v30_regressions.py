@@ -52,6 +52,14 @@ def test_01_pandoc_math_sum_integral_functions_matrices_and_indexed_roots(tmp_pa
     xml = doc._element.xml
     assert "m:oMath" in xml
     assert "m:f" in xml or "m:rad" in xml
+    assert doc._element.xpath(".//m:count")
+    for mc_pr in doc._element.xpath(".//m:mcPr"):
+        count = mc_pr.find(qn("m:count"))
+        mc_jc = mc_pr.find(qn("m:mcJc"))
+        if count is not None:
+            assert mc_jc is not None and mc_pr.index(count) < mc_pr.index(mc_jc)
+    assert all(not (run_properties.find(qn("m:nor")) is not None and run_properties.find(qn("m:sty")) is not None)
+               for run_properties in doc._element.xpath(".//m:rPr"))
     pdf, text = render(docx, tmp_path / "render")
     for raw in (r"\sum", r"\int", r"\frac", r"\sqrt", r"\begin{pmatrix}"):
         assert raw not in text
@@ -108,8 +116,12 @@ def test_06_gfm_short_separators_alignment_and_repeating_header(tmp_path):
     doc = Document(docx)
     tables = doc.tables
     assert tables
+    tbl_pr = tables[0]._tbl.tblPr
+    assert tbl_pr.index(tbl_pr.find(qn("w:tblLayout"))) < tbl_pr.index(tbl_pr.find(qn("w:tblLook")))
     first_row_xml = tables[0].rows[0]._tr.xml
     assert "tblHeader" in first_row_xml
+    headers = tables[0].rows[0]._tr.xpath("./w:trPr/w:tblHeader")
+    assert len(headers) == 1 and headers[0].get(qn("w:val")) == "on"
     alignments = [cell.paragraphs[0].alignment for cell in tables[0].rows[0].cells]
     assert alignments[0] == WD_ALIGN_PARAGRAPH.LEFT
     assert alignments[1] == WD_ALIGN_PARAGRAPH.CENTER
@@ -135,11 +147,13 @@ def test_08_inline_links_math_inside_bold_headings_and_horizontal_rule(tmp_path)
     pdf, text = render(docx, tmp_path / "inline")
     assert "OpenStax Biology" in text
     assert "https://www.ncbi.nlm.nih.gov/books/" in text
-    assert "the energy relation is" in text and "E=m" in text
+    assert "the energy relation is" in text
     assert "CHAPTERBREAKTOKEN" not in text
     with zipfile.ZipFile(docx) as zf:
         rels = zf.read("word/_rels/document.xml.rels").decode("utf-8")
         document_xml = zf.read("word/document.xml").decode("utf-8")
+    math_xml = re.findall(r"<m:oMath>(.*?)</m:oMath>", document_xml, re.S)
+    assert math_xml and "".join(re.findall(r"<m:t>(.*?)</m:t>", math_xml[0])) == "E=mc2"
     assert "https://openstax.org/details/books/biology-2e" in rels
     assert "https://www.ncbi.nlm.nih.gov/books/" in rels
     assert "<w:pict>" in document_xml and "o:hr=\"t\"" in document_xml, "Markdown --- must become a Word horizontal-rule drawing"
@@ -151,6 +165,8 @@ def test_09_callout_body_not_bold_blue_and_spaces_after_blocks(tmp_path):
     callouts = [t for t in doc.tables if t._tbl.tblPr.find(qn("w:tblCaption")) is not None
                 and t._tbl.tblPr.find(qn("w:tblCaption")).get(qn("w:val")) == "Callout"]
     assert callouts, "Expected blockquote content grouped in a callout table"
+    tbl_pr = callouts[0]._tbl.tblPr
+    assert tbl_pr.index(tbl_pr.find(qn("w:tblLayout"))) < tbl_pr.index(tbl_pr.find(qn("w:tblLook")))
     cell = callouts[0].cell(0, 0)
     paragraphs = cell.paragraphs
     assert len(paragraphs) == 1, "Consecutive blockquote lines should remain one coherent paragraph"
